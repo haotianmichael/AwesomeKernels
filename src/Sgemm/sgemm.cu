@@ -45,7 +45,7 @@ float compare_matrices(int m, int n, std::vector<float> &gpu_C, std::vector<floa
     return 0;
 }
 /*
-global_mem: 
+navie global_mem: 
     read: 每个线程:2K次，共M*N个线程——2MNK次
     write: MN次
 */
@@ -64,11 +64,71 @@ __global__ void cuda_sgemm_v0(float *A, float *B, float *C, const int M, const i
     return;
 }
 
+/*
+navie shared_mem:
+    cost too much shared_mem per block;
+*/
+template<unsigned int BLOCK_SIZE, unsigned int K_>
+__global__ void cuda_sgemm_v1(float *A, float *B, float *C, const int M, const int N, const int K) {
+    const int x = blockDim.x * blockIdx.x + threadIdx.x;
+    const int y = blockDim.y * blockIdx.y + threadIdx.y;
+    float *A_bck = A + blockDim.x * blockIdx.x * K;
+    float *B_bck = B + blockDim.y * blockIdx.y;
+
+    __shared__ float a_shared[BLOCK_SIZE][K_];
+    __shared__ float b_shared[K_][BLOCK_SIZE];
+
+    for(int s = 0; s < K; s += blockDim.x) {
+        a_shared[threadIdx.x][threadIdx.y + s] = A_bck[threadIdx.x * K + threadIdx.y + s];
+        b_shared[threadIdx.x + s][threadIdx.y] = B_bck[(threadIdx.x + s)* N + threadIdx.y];        
+    }
+    __syncthreads();
+
+    float res = 0.0f;
+    for(int k = 0; k < K; k ++) {
+        //res += A_bck[threadIdx.x * K + k] * B_bck[threadIdx.y + N * k];
+        res += a_shared[threadIdx.x][k] * b_shared[k][threadIdx.y];
+    }
+    C[x * N + y] = res;
+}
+
+/*
+opt1: tiled shared_mem
+*/
+template<unsigned int BLOCK_SIZE>
+__global__ void cuda_sgemm_v2(float *A, float *B, float *C, const int M, const int N, const int K) {
+
+    float *A_bck = A + blockIdx.x * blockDim.x * K;
+    float *B_bck = B + blockIdx.y * blockDim.y;
+
+    __shared__ float a_shared[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float b_shared[BLOCK_SIZE][BLOCK_SIZE];
+    const int x = blockDim.x * blockIdx.x + threadIdx.x;
+    const int y = blockDim.y * blockIdx.y + threadIdx.y;
+
+    float res = 0.0f;
+    for(int s = 0; s < K; s += BLOCK_SIZE) {
+        a_shared[threadIdx.x][threadIdx.y] = A_bck[threadIdx.x * K + threadIdx.y + s];
+        b_shared[threadIdx.x][threadIdx.y] = B_bck[(threadIdx.x + s) * N + threadIdx.y];
+
+        __syncthreads();
+        for(int k = 0; k < BLOCK_SIZE; k ++) {
+            res += a_shared[threadIdx.x][k] * b_shared[k][threadIdx.y];
+        }
+        __syncthreads();
+    }
+    C[x * N + y] = res;
+
+    return;
+}
+
+
+
 int main() {
    
     int m = 512;
     int n = 128;
-    int k = 256;
+    constexpr int k = 256;
     
     std::vector<float> h_A(m * k), h_B(k * n), h_C(m * n), gpu_C(m * n);
 
@@ -94,8 +154,17 @@ int main() {
 
     cuda_sgemm_v0<<<grid,block>>>(device_A, device_B, device_C, m, n, k);
     cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+    compare_matrices(m, n, gpu_C, h_C); 
 
-    float res = compare_matrices(m, n, gpu_C, h_C); 
+
+    cuda_sgemm_v1<BLOCK, k><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
+    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+    compare_matrices(m, n, gpu_C, h_C); 
+
+    cuda_sgemm_v2<BLOCK><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
+    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+    compare_matrices(m, n, gpu_C, h_C); 
+
     cudaFree(device_A);
     cudaFree(device_B);
     cudaFree(device_C);
