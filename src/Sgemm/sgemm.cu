@@ -56,7 +56,7 @@ __global__ void cuda_sgemm_v0(float *A, float *B, float *C, const int M, const i
 
     float res = 0.0f;
     for(int k = 0; k < K; k++) {
-        res += A_bck[threadIdx.x * K + k] * B_bck[threadIdx.y + k * M];
+        res += A_bck[threadIdx.x * K + k] * B_bck[threadIdx.y + k * N];
     }
     const int x = blockDim.x * blockIdx.x + threadIdx.x;
     const int y = blockDim.y * blockIdx.y + threadIdx.y;
@@ -67,8 +67,8 @@ __global__ void cuda_sgemm_v0(float *A, float *B, float *C, const int M, const i
 int main() {
    
     int m = 512;
-    int n = 512;
-    int k = 512;
+    int n = 128;
+    int k = 256;
     
     std::vector<float> h_A(m * k), h_B(k * n), h_C(m * n), gpu_C(m * n);
 
