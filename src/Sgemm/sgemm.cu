@@ -36,7 +36,7 @@ float compare_matrices(int m, int n, std::vector<float> &gpu_C, std::vector<floa
             max_diff = (diff > max_diff) ? diff : max_diff;
             if(printed == 0) {
                 if(max_diff > 0.5f || max_diff < -0.5f) {
-                    printf("\n error: i %d j %d\n", i, j);
+                    printf("\n error: i %d j %d\ncpu: %f gpu: %f\n", i, j, cpu_C[i*n+j], gpu_C[i*n+j]);
                     return max_diff;
                 }
             }
@@ -122,12 +122,58 @@ __global__ void cuda_sgemm_v2(float *A, float *B, float *C, const int M, const i
     return;
 }
 
+/*
+opt2: tiled register
+*/
+template<unsigned int BLOCK_SIZE, unsigned int STRIDE> 
+__global__ void cuda_sgemm_v3(float *A, float *B, float *C, const int M, const int N, const int K) {
+
+    const int STEP = BLOCK_SIZE * STRIDE;
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    float *A_bck = A + blockIdx.y * STEP * K;
+    float *B_bck = B + blockIdx.x * STEP;
+
+    __shared__ float tileA[STEP][STEP];
+    __shared__ float tileB[STEP][STEP];
+
+    float res[STRIDE][STRIDE];
+    for(int i = 0; i < STRIDE; i ++)
+        for(int j = 0; j < STRIDE; j ++)
+            res[i][j] = 0;
+
+    for(int s = 0; s < K; s += STEP) {
+        for(int i = 0; i < STRIDE; i ++) {
+            for(int j = 0; j < STRIDE; j ++) {
+                 tileA[ty + i * BLOCK_SIZE][tx + j * BLOCK_SIZE] = A_bck[(ty + i * BLOCK_SIZE)*K + tx + j * BLOCK_SIZE + s];
+                 tileB[ty + i * BLOCK_SIZE][tx + j * BLOCK_SIZE] = B_bck[(ty + i * BLOCK_SIZE + s) * N + tx + j * BLOCK_SIZE];
+            }
+        }
+        __syncthreads();
+
+        for(int i = 0; i < STRIDE; i ++) {
+            for(int j = 0; j < STRIDE; j ++) {
+                for(int k = 0; k < STEP; k ++) {
+                    res[i][j] += tileA[ty + i * BLOCK_SIZE][k] * tileB[k][tx + j * BLOCK_SIZE];
+                }
+            }
+        }
+        __syncthreads();
+    }
+    float *C_bck = C + blockIdx.y * STEP * N + blockIdx.x * STEP;
+    for(int i = 0; i < STRIDE; i ++) {
+        for(int j = 0; j < STRIDE; j ++) {
+            C_bck[(ty + i * BLOCK_SIZE) * N + tx + j * BLOCK_SIZE] = res[i][j];
+        }
+    }
+
+}
 
 
 int main() {
    
     int m = 512;
-    int n = 128;
+    int n = 512;
     constexpr int k = 256;
     
     std::vector<float> h_A(m * k), h_B(k * n), h_C(m * n), gpu_C(m * n);
@@ -150,9 +196,9 @@ int main() {
 
     constexpr int BLOCK = 16;
     dim3 block(BLOCK, BLOCK);
-    dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
+    //dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
 
-    cuda_sgemm_v0<<<grid,block>>>(device_A, device_B, device_C, m, n, k);
+    /*cuda_sgemm_v0<<<grid,block>>>(device_A, device_B, device_C, m, n, k);
     cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
     compare_matrices(m, n, gpu_C, h_C); 
 
@@ -162,6 +208,12 @@ int main() {
     compare_matrices(m, n, gpu_C, h_C); 
 
     cuda_sgemm_v2<BLOCK><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
+    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+    compare_matrices(m, n, gpu_C, h_C); */
+
+    constexpr int STRIDE = 2;
+    dim3 new_grid((m + BLOCK-1)/BLOCK/STRIDE, (m + BLOCK - 1)/BLOCK/STRIDE);
+    cuda_sgemm_v3<BLOCK, STRIDE><<<new_grid, block>>>(device_A, device_B, device_C, m, n, k);
     cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
     compare_matrices(m, n, gpu_C, h_C); 
 
