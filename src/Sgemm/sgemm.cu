@@ -169,6 +169,46 @@ __global__ void cuda_sgemm_v3(float *A, float *B, float *C, const int M, const i
 
 }
 
+/*
+opt3: float4
+*/
+#define FETCH_FLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
+template<unsigned int M_NUM_PER_BLOCK,
+         unsigned int N_NUM_PER_BLOCK,
+         unsigned int K_NUM_PER_BLOCK,
+         unsigned int NUM_PER_THREAD>
+__global__ void cuda_sgemm_v4(float *A, float *B, float *C, const int M, const int N, const int K) {
+
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    float *A_bck = A + blockIdx.y * M_NUM_PER_BLOCK * K;
+    float *B_bck = B + blockIdx.x * N_NUM_PER_BLOCK;
+
+    __shared__ float tileA[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
+    __shared__ float tileB[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
+
+    float res[NUM_PER_THREAD];
+    for(int i = 0; i < NUM_PER_THREAD; i ++) res[i] = 0.0f;
+
+    for(int s = 0; s < K; s += K_NUM_PER_BLOCK) {
+        FETCH_FLOAT4(tileA[ty][tx * NUM_PER_THREAD]) = FETCH_FLOAT4(A_bck[ty * K + s + tx * NUM_PER_THREAD]);
+        FETCH_FLOAT4(tileB[ty][tx * NUM_PER_THREAD]) = FETCH_FLOAT4(B_bck[(ty + s) * N + tx * NUM_PER_THREAD]);
+
+        __syncthreads();
+        for(int i = 0; i < NUM_PER_THREAD; i ++) {
+            for(int k = 0; k < K_NUM_PER_BLOCK; k ++) {
+                res[i] += tileA[ty][k] * tileB[k][tx * NUM_PER_THREAD + i];
+            }
+        }
+        __syncthreads();
+    }
+    float *C_bck = C + blockIdx.y * M_NUM_PER_BLOCK * N + blockIdx.x * N_NUM_PER_BLOCK;
+    for(int i = 0; i < NUM_PER_THREAD; i ++) {
+        C_bck[ty * N + tx * NUM_PER_THREAD + i] = res[i];
+    }
+    return;
+}
+
 
 int main() {
    
@@ -193,29 +233,64 @@ int main() {
     
 
     cpu_sgemm(h_A, h_B, h_C, m, k, n);
-
+    const int opt = 4;
     constexpr int BLOCK = 16;
-    dim3 block(BLOCK, BLOCK);
-    //dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
+    if(opt == 0) {
+        std::cout << "cuda_sgemm_v0" << std::endl;
+        dim3 block(BLOCK, BLOCK);
+        dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
 
-    /*cuda_sgemm_v0<<<grid,block>>>(device_A, device_B, device_C, m, n, k);
-    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-    compare_matrices(m, n, gpu_C, h_C); 
+        cuda_sgemm_v0<<<grid,block>>>(device_A, device_B, device_C, m, n, k);
+        cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+        compare_matrices(m, n, gpu_C, h_C); 
+    }else if(opt == 1) {
+        std::cout << "cuda_sgemm_v1" << std::endl;
+        dim3 block(BLOCK, BLOCK);
+        dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
+
+        cuda_sgemm_v1<BLOCK, k><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
+        cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+        compare_matrices(m, n, gpu_C, h_C); 
+    }else if(opt == 2) {
+        std::cout << "cuda_sgemm_v2" << std::endl;
+        dim3 block(BLOCK, BLOCK);
+        dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
+
+        cuda_sgemm_v2<BLOCK><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
+        cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+        compare_matrices(m, n, gpu_C, h_C); 
+    }else if(opt == 3) {
+        std::cout << "cuda_sgemm_v3" << std::endl;
+        constexpr int STRIDE = 2;
+        dim3 block(BLOCK, BLOCK);
+        dim3 grid_v3((m + BLOCK-1)/BLOCK/STRIDE, (m + BLOCK - 1)/BLOCK/STRIDE);
+
+        cuda_sgemm_v3<BLOCK, STRIDE><<<grid_v3, block>>>(device_A, device_B, device_C, m, n, k);
+        cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+        compare_matrices(m, n, gpu_C, h_C); 
+    }else if(opt == 4) {
+        std::cout << "cuda_sgemm_v4" << std::endl;
+        constexpr int M_NUM_PER_BLOCK = 32;    
+        constexpr int N_NUM_PER_BLOCK = 32;    
+        constexpr int K_NUM_PER_BLOCK = 32;    
+        constexpr int NUM_PER_THREAD = 4;    
+
+        dim3 block_v4(8, 32);
+        dim3 grid_v4((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
+        cuda_sgemm_v4<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4>>>(device_A, device_B, device_C, m, n, k);
+        cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+        compare_matrices(m, n, gpu_C, h_C); 
+    }else if(opt == 5) {
+
+    }else if(opt == 6) {
+
+    }
+   
 
 
-    cuda_sgemm_v1<BLOCK, k><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
-    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-    compare_matrices(m, n, gpu_C, h_C); 
+  
 
-    cuda_sgemm_v2<BLOCK><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
-    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-    compare_matrices(m, n, gpu_C, h_C); */
 
-    constexpr int STRIDE = 2;
-    dim3 new_grid((m + BLOCK-1)/BLOCK/STRIDE, (m + BLOCK - 1)/BLOCK/STRIDE);
-    cuda_sgemm_v3<BLOCK, STRIDE><<<new_grid, block>>>(device_A, device_B, device_C, m, n, k);
-    cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-    compare_matrices(m, n, gpu_C, h_C); 
 
     cudaFree(device_A);
     cudaFree(device_B);
