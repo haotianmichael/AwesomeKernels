@@ -5,6 +5,7 @@
 ## 参考
 * [CUDA矩阵乘法终极优化指南](https://zhuanlan.zhihu.com/p/410278370)
 * [GEMM理论性能分析与kernel优化](https://zhuanlan.zhihu.com/p/441146275)
+* [深入浅出GPU优化系列：GEMM优化(一)](https://zhuanlan.zhihu.com/p/435908830)
 
 ## 配置
 * 输入输出
@@ -54,7 +55,7 @@
         * 由线程(threadIdx.x = 5, threadIdx.y=7)加载到缓存
         * 被thread[0][7],thread[1][7]...thread[15][7]这16个线程读取16次
 
-## Opt2: 寄存器分块
+## Opt2: 向量化加载+Float4
 > 一个thread block中的256个线程处理1024个数据, 一个线程处理4个数据. 
 * 分块大小blockDim: 16x16
 * 每个block的数据量: 32x32 
@@ -69,7 +70,14 @@
   
 寄存器分块高效的本质就是：并未改变宏观计算访存比，但是在指令级别，提高了每次缓存访问的数据读取量——因此减少了每个warp的内存访问量，使得该warp更容易成为活跃warp从而进行延迟隐藏.
 
-## Opt3: Float4类型
-* 宏观计算访存比: 同上
-* 指令级计算指令与访存指令比例:
+## Opt3: 寄存器分块+内积转外积+索引重排
+### 从Global Mem到shared Mem
+访存算法：确定结果矩阵有多少个block，每个block的访存量，两者相乘
+* 全局版本(GM访存): M*N个block，每个2K次——2MNK
+* 分块版本(GM访存): 共M/bm * N/bn个block，每个K/bk次——访存比例为1/2(1/bm+1/bn)
+    * 这个值忽略了L2硬件缓存的功能，是一个Lower Bound
+    * 分块的Upper Bound是L2优化导致所有元素只读一次: 8KMN
+* 寄存器分块版本(SM访存): bm/rm * bm/rn个block，每个bk/rk次——1/2(1/rm + 1/rn)
+    * shared mem没有额外的缓存层，所以这个值是固定的
   
+## Opt4: 寄存器
