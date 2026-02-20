@@ -211,6 +211,8 @@ __global__ void cuda_sgemm_v4(float *A, float *B, float *C, const int M, const i
 
 /*
 寄存器分块 + 外积 + 索引重排的过渡版本
+初始线程布局: 8 x 32
+在做计算的时候索引重排
 */
 template<unsigned int M_NUM_PER_BLOCK,
          unsigned int N_NUM_PER_BLOCK,
@@ -260,7 +262,60 @@ __global__ void cuda_sgemm_v5(float *A, float *B, float *C, const int M, const i
 }
 
 /*
-寄存器分块+外积+索引重排+FLOAT4过渡版本
+初始线程布局: 16x16
+做加载的时候做索引重排 */
+template<unsigned int M_NUM_PER_BLOCK,
+         unsigned int N_NUM_PER_BLOCK,
+         unsigned int K_NUM_PER_BLOCK,
+         unsigned int NUM_PER_THREAD>
+__global__ void cuda_sgemm_v5_(float *A, float *B, float *C, const int M, const int N, const int K) {
+
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int tid = ty * blockDim.x + tx;
+    const int ctx_load = tid % 8;
+    const int cty_load = tid / 8;
+    float *A_bck = A + blockIdx.y * M_NUM_PER_BLOCK * K;
+    float *B_bck = B + blockIdx.x * N_NUM_PER_BLOCK;
+    float *C_bck = C + blockIdx.y * M_NUM_PER_BLOCK * N + blockIdx.x * N_NUM_PER_BLOCK;
+    
+    __shared__ float tileA[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
+    __shared__ float tileB[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
+    const int REG_NUM = NUM_PER_THREAD / 2;
+    float res[REG_NUM][REG_NUM];
+    float regA[REG_NUM];
+    float regB[REG_NUM];
+
+    for(int s = 0; s < K; s += K_NUM_PER_BLOCK) {
+
+        FETCH_FLOAT4(tileA[cty_load][ctx_load * NUM_PER_THREAD]) = FETCH_FLOAT4(A_bck[cty_load * K + s + ctx_load * NUM_PER_THREAD]);
+        FETCH_FLOAT4(tileB[cty_load][ctx_load * NUM_PER_THREAD]) = FETCH_FLOAT4(B_bck[(cty_load + s) * N + ctx_load * NUM_PER_THREAD]);
+
+        __syncthreads();
+        for(int k = 0; k < K_NUM_PER_BLOCK; k ++) {
+            regA[0] = tileA[ty * REG_NUM][k];
+            regA[1] = tileA[ty * REG_NUM + 1][k];
+            regB[0] = tileB[k][tx * REG_NUM];
+            regB[1] = tileB[k][tx * REG_NUM + 1];
+            for(int i = 0; i < REG_NUM; i ++) {
+                for(int j = 0; j < REG_NUM; j ++) {
+                    res[i][j] += regA[i] * regB[j];
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+    for(int i = 0; i < REG_NUM; i ++) {
+        for(int j = 0; j < REG_NUM; j ++) {
+            C_bck[(ty * REG_NUM +i) * N + tx * REG_NUM + j] = res[i][j];
+        }
+    }
+}
+
+/*
+寄存器分块+外积+FLOAT4过渡版本
 */
 template<unsigned int M_NUM_PER_BLOCK,
          unsigned int N_NUM_PER_BLOCK,
@@ -312,6 +367,51 @@ __global__ void cuda_sgemm_v6(float *A, float *B, float *C, const int M, const i
     float *C_bck = C + blockIdx.y * M_NUM_PER_BLOCK * N + blockIdx.x * N_NUM_PER_BLOCK;
     for(int i = 0; i < M_NUM_PER_THREAD; i ++) {
         FETCH_FLOAT4(C_bck[N * (ty * M_NUM_PER_THREAD + i) + tx * N_NUM_PER_THREAD]) = FETCH_FLOAT4(res[i][0]);
+    }
+    return;
+}
+
+/*
+v6_: FLOAT4 + 一个线程处理4x4个数据
+*/
+template<unsigned int M_NUM_PER_BLOCK,
+         unsigned int N_NUM_PER_BLOCK,
+         unsigned int K_NUM_PER_BLOCK,
+         unsigned int M_NUM_PER_THREAD,
+         unsigned int N_NUM_PER_THREAD,
+         unsigned int K_NUM_PER_THREAD>
+__global__ void cuda_sgemm_v6_(float *A, float *B, float *C, const int M, const int N, const int K) {
+
+    float *A_bck = A + blockIdx.y * M_NUM_PER_BLOCK * K;
+    float *B_bck = B + blockIdx.x * N_NUM_PER_BLOCK;
+    float *C_bck = C + blockIdx.y * M_NUM_PER_BLOCK * N + blockIdx.x * N_NUM_PER_BLOCK;
+    
+    const int tx = threadIdx.x;
+    const int ty = threadIdx.y;
+    __shared__ float tileA[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
+    __shared__ float tileB[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
+    float res[M_NUM_PER_THREAD][N_NUM_PER_THREAD] = {0.0f};
+
+    for(int s = 0; s < K; s += K_NUM_PER_BLOCK) {
+        for(int i = 0; i < M_NUM_PER_THREAD; i ++) {
+            FETCH_FLOAT4(tileA[ty * M_NUM_PER_THREAD + i][tx * K_NUM_PER_THREAD]) = FETCH_FLOAT4(A_bck[K * (ty * M_NUM_PER_THREAD + i) + s + tx * K_NUM_PER_THREAD]);
+            FETCH_FLOAT4(tileB[ty * K_NUM_PER_THREAD + i][tx * N_NUM_PER_THREAD]) = FETCH_FLOAT4(B_bck[N * (ty * K_NUM_PER_THREAD + i + s) + tx * N_NUM_PER_THREAD]);
+        } 
+
+        __syncthreads();
+        for(int i = 0; i < M_NUM_PER_THREAD; i ++) {
+            for(int j = 0; j < N_NUM_PER_THREAD; j ++) {
+                for(int k = 0; k < K_NUM_PER_BLOCK; k ++) {
+                    res[i][j] += tileA[ty * M_NUM_PER_THREAD + i][k] * tileB[k][tx * N_NUM_PER_THREAD + j];
+                }
+            }
+        } 
+        __syncthreads();
+    }
+    for(int i = 0; i < M_NUM_PER_THREAD; i ++) {
+        for(int j = 0; j < N_NUM_PER_THREAD; j ++) {
+            C_bck[N * (i + ty * M_NUM_PER_THREAD) + tx * N_NUM_PER_THREAD + j] = res[i][j];
+        }
     }
     return;
 }
@@ -374,6 +474,48 @@ __global__ void cuda_sgemm_v7(float *A, float *B, float *C, const int M, const i
     return;
 }
 
+/*
+v8: 双缓冲
+*/
+/*template<unsigned int M_NUM_PER_BLOCK,
+         unsigned int K_NUM_PER_BLOCK,
+         unsigned int N_NUM_PER_BLOCK,
+         unsigned int THREAD_SIZE_X,
+         unsigned int THREAD_SIZE_Y>
+__global__ void cuda_sgemm_v8(float *A, float *B, float *C, const int M, const int N, const int K) {
+
+        const int tx = threadIdx.x;
+        const int ty = threadIdx.y;
+        const int tid = ty * blockDim.x + tx;
+        const int cty = tid % 8;  // 0-7
+        const int ctx = tid / 8;
+
+        float *A_bck = A + blockIdx.y * M_NUM_PER_BLOCK * K;
+        float *B_bck = B + blockIdx.x * N_NUM_PER_BLOCK;
+
+        __shared__ float tileA[THREAD_SIZE_Y][THREAD_SIZE_X];
+        __shared__ float tileB[THREAD_SIZE_Y][THREAD_SIZE_X];
+        float regA[THREAD_SIZE_Y];
+        float regB[THREAD_SIZE_X];
+        float res[THREAD_SIZE_Y][THREAD_SIZE_X];
+
+        for(int s = 0; s < K; s += K_NUM_PER_BLOCK) {
+
+            FETCH_FLOAT4(tileA[][cty])
+            FETCH_FLOAT4(tileB[cty][ctx * 4]) = FETCH_FLOAT4(B_bck[(cty+s) * N + ctx * 4]);
+
+            __syncthreads();
+            for(int i = 0; i < THREAD_SIZE_X; i ++) {
+                for(int j = 0; j < THREAD_SIZE_Y; j ++) {
+                    res[i][j] += tileA[][] * tileB[][]; 
+                }
+            }
+            __syncthreads();
+        }
+
+
+        return;
+}*/
 
 int main() {
    
@@ -398,7 +540,7 @@ int main() {
     
 
     cpu_sgemm(h_A, h_B, h_C, m, k, n);
-    const int opt = 7;
+    const int opt = 5;
     constexpr int BLOCK = 16;
     if(opt == 0) {
         std::cout << "cuda_sgemm_v0" << std::endl;
@@ -413,7 +555,7 @@ int main() {
         dim3 block(BLOCK, BLOCK);
         dim3 grid((m + BLOCK - 1) / BLOCK, (n + BLOCK - 1) / BLOCK);
 
-        cuda_sgemm_v1<BLOCK, k><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
+        //cuda_sgemm_v1<BLOCK, k><<<grid, block>>>(device_A, device_B, device_C, m, n, k);
         cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
         compare_matrices(m, n, gpu_C, h_C); 
     }else if(opt == 2) {
@@ -452,9 +594,11 @@ int main() {
         constexpr int K_NUM_PER_BLOCK = 32;    
         constexpr int NUM_PER_THREAD = 4;    
 
-        dim3 block_v4(8, 32);
+        //dim3 block_v4(8, 32);
+        dim3 block_v4_new(16, 16);
         dim3 grid_v4((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
-        cuda_sgemm_v5<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4>>>(device_A, device_B, device_C, m, n, k);
+        //cuda_sgemm_v5<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4_new>>>(device_A, device_B, device_C, m, n, k);
+        cuda_sgemm_v5_<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4_new>>>(device_A, device_B, device_C, m, n, k);
         cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
         compare_matrices(m, n, gpu_C, h_C); 
 
@@ -469,7 +613,7 @@ int main() {
 
         dim3 block_v6(16, 16);
         dim3 grid_v6((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
-        cuda_sgemm_v6<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, M_NUM_PER_THREAD, N_NUM_PER_THREAD, K_NUM_PER_THREAD><<<grid_v6, block_v6>>>(device_A, device_B, device_C, m, n, k);
+        cuda_sgemm_v6_<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, M_NUM_PER_THREAD, N_NUM_PER_THREAD, K_NUM_PER_THREAD><<<grid_v6, block_v6>>>(device_A, device_B, device_C, m, n, k);
         cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
         compare_matrices(m, n, gpu_C, h_C); 
     }else if(opt == 7) {
@@ -486,13 +630,20 @@ int main() {
         cuda_sgemm_v7<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, M_NUM_PER_THREAD, N_NUM_PER_THREAD, K_NUM_PER_THREAD><<<grid_v6, block_v6>>>(device_A, device_B, device_C, m, n, k);
         cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
         compare_matrices(m, n, gpu_C, h_C); 
+    }else if(opt == 8) {
+        std::cout << "cuda_sgemm_v8" << std::endl;
+        constexpr int M_NUM_PER_BLOCK = 128;
+        constexpr int N_NUM_PER_BLOCK = 128;
+        constexpr int K_NUM_PER_BLOCK = 8;
+        constexpr int THREAD_SIZE_X = 8;
+        constexpr int THREAD_SIZE_Y = 8;
+
+        /*dim3 block_v8(16, 16);
+        dim3 grid_v8((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
+        cuda_sgemm_v8<M_NUM_PER_BLOCK, K_NUM_PER_BLOCK, N_NUM_PER_BLOCK, THREAD_SIZE_X, THREAD_SIZE_Y><<<grid_v8, block_v8>>>(device_A, device_B, device_C, m, n, k);
+        cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
+        compare_matrices(m, n, gpu_C, h_C); */
     }
-   
-
-
-  
-
-
 
     cudaFree(device_A);
     cudaFree(device_B);

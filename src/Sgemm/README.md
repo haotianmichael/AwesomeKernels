@@ -80,3 +80,4 @@
 * 寄存器分块版本(SM访存): bm/rm * bm/rn个block，每个bk/rk次——1/2(1/rm + 1/rn)
     * shared mem没有额外的缓存层，所以这个值是固定的
   
+## Opt4: 双缓冲+流水并行
