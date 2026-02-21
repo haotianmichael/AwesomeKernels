@@ -2,6 +2,7 @@
 #include <iostream>
 #include <algorithm>
 #include <cstdlib>
+#include <pthread.h>
 #include <random>
 #include <vector>
 
@@ -282,7 +283,7 @@ __global__ void cuda_sgemm_v5_(float *A, float *B, float *C, const int M, const 
     __shared__ float tileA[M_NUM_PER_BLOCK][K_NUM_PER_BLOCK];
     __shared__ float tileB[K_NUM_PER_BLOCK][N_NUM_PER_BLOCK];
     const int REG_NUM = NUM_PER_THREAD / 2;
-    float res[REG_NUM][REG_NUM];
+    float res[REG_NUM][REG_NUM] = {0.0f};
     float regA[REG_NUM];
     float regB[REG_NUM];
 
@@ -292,6 +293,15 @@ __global__ void cuda_sgemm_v5_(float *A, float *B, float *C, const int M, const 
         FETCH_FLOAT4(tileB[cty_load][ctx_load * NUM_PER_THREAD]) = FETCH_FLOAT4(B_bck[(cty_load + s) * N + ctx_load * NUM_PER_THREAD]);
 
         __syncthreads();
+        /* 普通内积版本
+        for(int i = 0; i < REG_NUM; i ++) {
+            for(int j = 0; j < REG_NUM; j ++) {
+                for(int k = 0; k < K_NUM_PER_BLOCK; k ++) {
+                    res[i][j] += tileA[ty * REG_NUM + i][k] * tileB[k][tx * REG_NUM + j];
+                }
+            }
+        }*/
+        //寄存器分块+外积版本
         for(int k = 0; k < K_NUM_PER_BLOCK; k ++) {
             regA[0] = tileA[ty * REG_NUM][k];
             regA[1] = tileA[ty * REG_NUM + 1][k];
@@ -594,10 +604,10 @@ int main() {
         constexpr int K_NUM_PER_BLOCK = 32;    
         constexpr int NUM_PER_THREAD = 4;    
 
-        //dim3 block_v4(8, 32);
+        dim3 block_v4(8, 32);
         dim3 block_v4_new(16, 16);
         dim3 grid_v4((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
-        //cuda_sgemm_v5<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4_new>>>(device_A, device_B, device_C, m, n, k);
+        //cuda_sgemm_v5<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4>>>(device_A, device_B, device_C, m, n, k);
         cuda_sgemm_v5_<M_NUM_PER_BLOCK, N_NUM_PER_BLOCK, K_NUM_PER_BLOCK, NUM_PER_THREAD><<<grid_v4, block_v4_new>>>(device_A, device_B, device_C, m, n, k);
         cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
         compare_matrices(m, n, gpu_C, h_C); 
