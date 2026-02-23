@@ -457,47 +457,90 @@ __global__ void cuda_sgemm_v7_(float *A, float *B, float *C, const int M, const 
 }
 
 /*
-v8: 双缓冲
+v8: 索引重排+转置(当m,k,n不一致时)+双缓冲
 */
-/*template<unsigned int M_NUM_PER_BLOCK,
-         unsigned int K_NUM_PER_BLOCK,
-         unsigned int N_NUM_PER_BLOCK,
+template<unsigned int BLOCK_SIZE_M,
+         unsigned int BLOCK_SIZE_K,
+         unsigned int BLOCK_SIZE_N,
          unsigned int THREAD_SIZE_X,
          unsigned int THREAD_SIZE_Y>
 __global__ void cuda_sgemm_v8(float *A, float *B, float *C, const int M, const int N, const int K) {
 
-        const int tx = threadIdx.x;
-        const int ty = threadIdx.y;
-        const int tid = ty * blockDim.x + tx;
-        const int cty = tid % 8;  // 0-7
-        const int ctx = tid / 8;
+    float *A_bck = A + blockIdx.y * BLOCK_SIZE_M * K;
+    float *B_bck = B + blockIdx.x * BLOCK_SIZE_N;
+    float *C_bck = C + blockIdx.y * BLOCK_SIZE_M * N + blockIdx.x * BLOCK_SIZE_N;
 
-        float *A_bck = A + blockIdx.y * M_NUM_PER_BLOCK * K;
-        float *B_bck = B + blockIdx.x * N_NUM_PER_BLOCK;
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int tid = ty * blockDim.x + tx;
+    const int A_tile_thread_per_row = BLOCK_SIZE_K / 4;  // 2
+    const int B_tile_thread_per_row = BLOCK_SIZE_N / 4;  // 32
+    const int A_tile_tid_x = tid % A_tile_thread_per_row; // 0,1
+    const int A_tile_tid_y = tid / A_tile_thread_per_row; // 0-127
+    const int B_tile_tid_x = tid % B_tile_thread_per_row; // 0-31
+    const int B_tile_tid_y = tid / B_tile_thread_per_row; // 0-8
 
-        __shared__ float tileA[THREAD_SIZE_Y][THREAD_SIZE_X];
-        __shared__ float tileB[THREAD_SIZE_Y][THREAD_SIZE_X];
-        float regA[THREAD_SIZE_Y];
-        float regB[THREAD_SIZE_X];
-        float res[THREAD_SIZE_Y][THREAD_SIZE_X];
 
-        for(int s = 0; s < K; s += K_NUM_PER_BLOCK) {
+    __shared__ float tileA[2][BLOCK_SIZE_K][BLOCK_SIZE_M];
+    __shared__ float tileB[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
 
-            FETCH_FLOAT4(tileA[][cty])
-            FETCH_FLOAT4(tileB[cty][ctx * 4]) = FETCH_FLOAT4(B_bck[(cty+s) * N + ctx * 4]);
+    float regA[THREAD_SIZE_Y] = {0.0f};
+    float regB[THREAD_SIZE_X] = {0.0f};
+    float a_load[4] = {0.0f};
+    float res[THREAD_SIZE_Y][THREAD_SIZE_X] = {0.0f};
+    unsigned int write_stage_idx = 0;
 
-            __syncthreads();
-            for(int i = 0; i < THREAD_SIZE_X; i ++) {
-                for(int j = 0; j < THREAD_SIZE_Y; j ++) {
-                    res[i][j] += tileA[][] * tileB[][]; 
+    FETCH_FLOAT4(a_load[0]) = FETCH_FLOAT4(A_bck[A_tile_tid_y * K + A_tile_tid_x * 4]);
+    tileA[write_stage_idx][A_tile_tid_x * 4][A_tile_tid_y] = a_load[0];
+    tileA[write_stage_idx][A_tile_tid_x * 4 + 1][A_tile_tid_y] = a_load[1];
+    tileA[write_stage_idx][A_tile_tid_x * 4 + 2][A_tile_tid_y] = a_load[2];
+    tileA[write_stage_idx][A_tile_tid_x * 4 + 3][A_tile_tid_y] = a_load[3];
+    FETCH_FLOAT4(tileB[write_stage_idx][B_tile_tid_y][B_tile_tid_x * 4]) = FETCH_FLOAT4(B_bck[B_tile_tid_y*N + B_tile_tid_x*4]);
+
+    __syncthreads();
+    write_stage_idx ^= 1;
+    for(int s = BLOCK_SIZE_K; s < K; s+= BLOCK_SIZE_K) {
+        FETCH_FLOAT4(a_load[0]) = FETCH_FLOAT4(A_bck[A_tile_tid_y * K + s + A_tile_tid_x * 4]);
+        tileA[write_stage_idx][A_tile_tid_x * 4][A_tile_tid_y] = a_load[0];
+        tileA[write_stage_idx][A_tile_tid_x * 4 + 1][A_tile_tid_y] = a_load[1];
+        tileA[write_stage_idx][A_tile_tid_x * 4 + 2][A_tile_tid_y] = a_load[2];
+        tileA[write_stage_idx][A_tile_tid_x * 4 + 3][A_tile_tid_y] = a_load[3];
+        FETCH_FLOAT4(tileB[write_stage_idx][B_tile_tid_y][B_tile_tid_x * 4]) = FETCH_FLOAT4(B_bck[(s + B_tile_tid_y)*N + B_tile_tid_x*4]);
+
+        write_stage_idx ^= 1;
+        for(int k = 0; k < BLOCK_SIZE_K; k ++) {
+            FETCH_FLOAT4(regA[0]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y]);
+            FETCH_FLOAT4(regA[4]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y + 4]);
+            FETCH_FLOAT4(regB[0]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X]);
+            FETCH_FLOAT4(regB[4]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X + 4]);
+            for(int i = 0; i < THREAD_SIZE_Y; i ++) {
+                for(int j = 0; j < THREAD_SIZE_X; j ++) {
+                    res[i][j] += regA[i] * regB[j];
                 }
             }
-            __syncthreads();
         }
 
+        __syncthreads();
+    }
+    write_stage_idx ^= 1;
+    for(int k = 0; k < BLOCK_SIZE_K; k ++) {
+        FETCH_FLOAT4(regA[0]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y]);
+        FETCH_FLOAT4(regA[4]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y + 4]);
+        FETCH_FLOAT4(regB[0]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X]);
+        FETCH_FLOAT4(regB[4]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X + 4]);
+        for(int i = 0; i < THREAD_SIZE_Y; i ++) {
+            for(int j = 0; j < THREAD_SIZE_X; j ++) {
+                res[i][j] += regA[i] * regB[j];
+            }
+        }
+    }
+    for(int i = 0; i < THREAD_SIZE_X; i ++) {
+        FETCH_FLOAT4(C_bck[N * (ty * THREAD_SIZE_Y + i) + tx * THREAD_SIZE_X]) = FETCH_FLOAT4(res[i][0]);
+        FETCH_FLOAT4(C_bck[N * (ty * THREAD_SIZE_Y + i) + tx * THREAD_SIZE_X + 4]) = FETCH_FLOAT4(res[i][4]);
+    }
 
-        return;
-}*/
+    return;
+}
 
 int main() {
    
@@ -522,7 +565,7 @@ int main() {
     
 
     cpu_sgemm(h_A, h_B, h_C, m, k, n);
-    const int opt = 7;
+    const int opt = 8;
     constexpr int BLOCK = 16;
     if(opt == 0) {
         std::cout << "cuda_sgemm_v0" << std::endl;
@@ -614,17 +657,17 @@ int main() {
         compare_matrices(m, n, gpu_C, h_C); 
     }else if(opt == 8) {
         std::cout << "cuda_sgemm_v8" << std::endl;
-        constexpr int M_NUM_PER_BLOCK = 128;
-        constexpr int N_NUM_PER_BLOCK = 128;
-        constexpr int K_NUM_PER_BLOCK = 8;
+        constexpr int BLOCK_SIZE_M = 128;
+        constexpr int BLOCK_SIZE_N = 128;
+        constexpr int BLOCK_SIZE_K = 8;
         constexpr int THREAD_SIZE_X = 8;
         constexpr int THREAD_SIZE_Y = 8;
 
-        /*dim3 block_v8(16, 16);
-        dim3 grid_v8((m + M_NUM_PER_BLOCK - 1) / M_NUM_PER_BLOCK, (n + N_NUM_PER_BLOCK - 1) / N_NUM_PER_BLOCK);
-        cuda_sgemm_v8<M_NUM_PER_BLOCK, K_NUM_PER_BLOCK, N_NUM_PER_BLOCK, THREAD_SIZE_X, THREAD_SIZE_Y><<<grid_v8, block_v8>>>(device_A, device_B, device_C, m, n, k);
+        dim3 block_v8(16, 16);
+        dim3 grid_v8((m + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M, (n + BLOCK_SIZE_N- 1) / BLOCK_SIZE_N);
+        cuda_sgemm_v8<BLOCK_SIZE_M, BLOCK_SIZE_K, BLOCK_SIZE_N, THREAD_SIZE_X, THREAD_SIZE_Y><<<grid_v8, block_v8>>>(device_A, device_B, device_C, m, n, k);
         cudaMemcpy(gpu_C.data(), device_C, m * n * sizeof(float), cudaMemcpyDeviceToHost);
-        compare_matrices(m, n, gpu_C, h_C); */
+        compare_matrices(m, n, gpu_C, h_C);
     }
 
     cudaFree(device_A);
