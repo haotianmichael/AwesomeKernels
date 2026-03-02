@@ -544,8 +544,8 @@ __global__ void cuda_sgemm_v8(float *A, float *B, float *C, const int M, const i
 
 int main() {
    
-    int m = 512;
-    int n = 512;
+    unsigned int m = 512;
+    unsigned int n = 512;
     constexpr int k = 256;
     
     std::vector<float> h_A(m * k), h_B(k * n), h_C(m * n), gpu_C(m * n);
@@ -657,11 +657,11 @@ int main() {
         compare_matrices(m, n, gpu_C, h_C); 
     }else if(opt == 8) {
         std::cout << "cuda_sgemm_v8" << std::endl;
-        constexpr int BLOCK_SIZE_M = 128;
-        constexpr int BLOCK_SIZE_N = 128;
-        constexpr int BLOCK_SIZE_K = 8;
-        constexpr int THREAD_SIZE_X = 8;
-        constexpr int THREAD_SIZE_Y = 8;
+        constexpr unsigned int BLOCK_SIZE_M = 128;
+        constexpr unsigned int BLOCK_SIZE_N = 128;
+        constexpr unsigned int BLOCK_SIZE_K = 8;
+        constexpr unsigned int THREAD_SIZE_X = 8;
+        constexpr unsigned int THREAD_SIZE_Y = 8;
 
         dim3 block_v8(16, 16);
         dim3 grid_v8((m + BLOCK_SIZE_M - 1) / BLOCK_SIZE_M, (n + BLOCK_SIZE_N- 1) / BLOCK_SIZE_N);
