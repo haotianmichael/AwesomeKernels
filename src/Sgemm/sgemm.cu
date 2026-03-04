@@ -459,6 +459,7 @@ __global__ void cuda_sgemm_v7_(float *A, float *B, float *C, const int M, const 
 /*
 v8: 索引重排+转置(当m,k,n不一致时)+双缓冲
 */
+#define LDSTFLOAT4(pointer) (reinterpret_cast<float4*>(&(pointer))[0])
 template<unsigned int BLOCK_SIZE_M,
          unsigned int BLOCK_SIZE_K,
          unsigned int BLOCK_SIZE_N,
@@ -466,77 +467,83 @@ template<unsigned int BLOCK_SIZE_M,
          unsigned int THREAD_SIZE_Y>
 __global__ void cuda_sgemm_v8(float *A, float *B, float *C, const int M, const int N, const int K) {
 
-    float *A_bck = A + blockIdx.y * BLOCK_SIZE_M * K;
-    float *B_bck = B + blockIdx.x * BLOCK_SIZE_N;
-    float *C_bck = C + blockIdx.y * BLOCK_SIZE_M * N + blockIdx.x * BLOCK_SIZE_N;
+    unsigned int row = blockIdx.y * BLOCK_SIZE_M;
+    unsigned int col = blockIdx.x * BLOCK_SIZE_N;
 
-    const int ty = threadIdx.y;
-    const int tx = threadIdx.x;
-    const int tid = ty * blockDim.x + tx;
-    const int A_tile_thread_per_row = BLOCK_SIZE_K / 4;  // 2
-    const int B_tile_thread_per_row = BLOCK_SIZE_N / 4;  // 32
-    const int A_tile_tid_x = tid % A_tile_thread_per_row; // 0,1
-    const int A_tile_tid_y = tid / A_tile_thread_per_row; // 0-127
-    const int B_tile_tid_x = tid % B_tile_thread_per_row; // 0-31
-    const int B_tile_tid_y = tid / B_tile_thread_per_row; // 0-8
+    if(row >= M || col >= N) return;
+    float *A_bck = A + row * K;
+    float *B_bck = B + col;
+    float *C_bck = C + row * N + col;
 
+    unsigned int ty = threadIdx.y;
+    unsigned int tx = threadIdx.x;
+    unsigned int tid = ty * blockDim.x + tx;
+    const int A_tile_per_row = BLOCK_SIZE_K / 4; // 2
+    const int B_tile_per_row = BLOCK_SIZE_M / 4;  // 32
+    const int A_tile_thread_y = tid / A_tile_per_row;
+    const int A_tile_thread_x = tid % A_tile_per_row;
+    const int B_tile_thread_y = tid / B_tile_per_row;
+    const int B_tile_thread_x = tid % B_tile_per_row;
+    unsigned int K_NUM_TILES = (K + BLOCK_SIZE_K - 1) / BLOCK_SIZE_K;
 
     __shared__ float tileA[2][BLOCK_SIZE_K][BLOCK_SIZE_M];
     __shared__ float tileB[2][BLOCK_SIZE_K][BLOCK_SIZE_N];
 
     float regA[THREAD_SIZE_Y] = {0.0f};
     float regB[THREAD_SIZE_X] = {0.0f};
-    float a_load[4] = {0.0f};
+    float A_load[4] = {0.0f};
     float res[THREAD_SIZE_Y][THREAD_SIZE_X] = {0.0f};
-    unsigned int write_stage_idx = 0;
+    unsigned int write_stage = 0;
 
-    FETCH_FLOAT4(a_load[0]) = FETCH_FLOAT4(A_bck[A_tile_tid_y * K + A_tile_tid_x * 4]);
-    tileA[write_stage_idx][A_tile_tid_x * 4][A_tile_tid_y] = a_load[0];
-    tileA[write_stage_idx][A_tile_tid_x * 4 + 1][A_tile_tid_y] = a_load[1];
-    tileA[write_stage_idx][A_tile_tid_x * 4 + 2][A_tile_tid_y] = a_load[2];
-    tileA[write_stage_idx][A_tile_tid_x * 4 + 3][A_tile_tid_y] = a_load[3];
-    FETCH_FLOAT4(tileB[write_stage_idx][B_tile_tid_y][B_tile_tid_x * 4]) = FETCH_FLOAT4(B_bck[B_tile_tid_y*N + B_tile_tid_x*4]);
-
+    LDSTFLOAT4(A_load[0]) = LDSTFLOAT4(A_bck[A_tile_thread_y * K + A_tile_thread_x * 4]);
+    tileA[write_stage][A_tile_thread_x * 4][A_tile_thread_y] = A_load[0];
+    tileA[write_stage][A_tile_thread_x * 4 + 1][A_tile_thread_y] = A_load[1];
+    tileA[write_stage][A_tile_thread_x * 4 + 2][A_tile_thread_y] = A_load[2];
+    tileA[write_stage][A_tile_thread_x * 4 + 3][A_tile_thread_y] = A_load[3];
+    LDSTFLOAT4(tileB[write_stage][B_tile_thread_y][B_tile_thread_x * 4]) = LDSTFLOAT4(B_bck[B_tile_thread_y * N + B_tile_thread_x * 4]);
+    write_stage ^= 1;
     __syncthreads();
-    write_stage_idx ^= 1;
-    for(int s = BLOCK_SIZE_K; s < K; s+= BLOCK_SIZE_K) {
-        FETCH_FLOAT4(a_load[0]) = FETCH_FLOAT4(A_bck[A_tile_tid_y * K + s + A_tile_tid_x * 4]);
-        tileA[write_stage_idx][A_tile_tid_x * 4][A_tile_tid_y] = a_load[0];
-        tileA[write_stage_idx][A_tile_tid_x * 4 + 1][A_tile_tid_y] = a_load[1];
-        tileA[write_stage_idx][A_tile_tid_x * 4 + 2][A_tile_tid_y] = a_load[2];
-        tileA[write_stage_idx][A_tile_tid_x * 4 + 3][A_tile_tid_y] = a_load[3];
-        FETCH_FLOAT4(tileB[write_stage_idx][B_tile_tid_y][B_tile_tid_x * 4]) = FETCH_FLOAT4(B_bck[(s + B_tile_tid_y)*N + B_tile_tid_x*4]);
 
-        write_stage_idx ^= 1;
+    for(int s = BLOCK_SIZE_K; s < K; s += BLOCK_SIZE_K) {
+        LDSTFLOAT4(A_load[0]) = LDSTFLOAT4(A_bck[s + A_tile_thread_y * K + A_tile_thread_x * 4]);
+        tileA[write_stage][A_tile_thread_x * 4][A_tile_thread_y] = A_load[0];
+        tileA[write_stage][A_tile_thread_x * 4 + 1][A_tile_thread_y] = A_load[1];
+        tileA[write_stage][A_tile_thread_x * 4 + 2][A_tile_thread_y] = A_load[2];
+        tileA[write_stage][A_tile_thread_x * 4 + 3][A_tile_thread_y] = A_load[3];
+        LDSTFLOAT4(tileB[write_stage][B_tile_thread_y][B_tile_thread_x * 4]) = LDSTFLOAT4(B_bck[(s + B_tile_thread_y) * N + B_tile_thread_x * 4]);
+        write_stage ^= 1;
+
         for(int k = 0; k < BLOCK_SIZE_K; k ++) {
-            FETCH_FLOAT4(regA[0]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y]);
-            FETCH_FLOAT4(regA[4]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y + 4]);
-            FETCH_FLOAT4(regB[0]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X]);
-            FETCH_FLOAT4(regB[4]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X + 4]);
+            LDSTFLOAT4(regA[0]) = LDSTFLOAT4(tileA[write_stage][k][ty * THREAD_SIZE_Y]);
+            LDSTFLOAT4(regA[4]) = LDSTFLOAT4(tileA[write_stage][k][ty * THREAD_SIZE_Y + 4]);
+            LDSTFLOAT4(regB[0]) = LDSTFLOAT4(tileB[write_stage][k][tx * THREAD_SIZE_Y]);
+            LDSTFLOAT4(regB[4]) = LDSTFLOAT4(tileB[write_stage][k][tx * THREAD_SIZE_Y + 4]);
+
             for(int i = 0; i < THREAD_SIZE_Y; i ++) {
                 for(int j = 0; j < THREAD_SIZE_X; j ++) {
                     res[i][j] += regA[i] * regB[j];
                 }
             }
         }
-
         __syncthreads();
     }
-    write_stage_idx ^= 1;
+
+    write_stage ^= 1;
     for(int k = 0; k < BLOCK_SIZE_K; k ++) {
-        FETCH_FLOAT4(regA[0]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y]);
-        FETCH_FLOAT4(regA[4]) = FETCH_FLOAT4(tileA[write_stage_idx][k][ty * THREAD_SIZE_Y + 4]);
-        FETCH_FLOAT4(regB[0]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X]);
-        FETCH_FLOAT4(regB[4]) = FETCH_FLOAT4(tileB[write_stage_idx][k][tx * THREAD_SIZE_X + 4]);
+        LDSTFLOAT4(regA[0]) = LDSTFLOAT4(tileA[write_stage][k][ty * THREAD_SIZE_Y]);
+        LDSTFLOAT4(regA[4]) = LDSTFLOAT4(tileA[write_stage][k][ty * THREAD_SIZE_Y + 4]);
+        LDSTFLOAT4(regB[0]) = LDSTFLOAT4(tileB[write_stage][k][tx * THREAD_SIZE_Y]);
+        LDSTFLOAT4(regB[4]) = LDSTFLOAT4(tileB[write_stage][k][tx * THREAD_SIZE_Y + 4]);
+
         for(int i = 0; i < THREAD_SIZE_Y; i ++) {
             for(int j = 0; j < THREAD_SIZE_X; j ++) {
                 res[i][j] += regA[i] * regB[j];
             }
         }
     }
-    for(int i = 0; i < THREAD_SIZE_X; i ++) {
-        FETCH_FLOAT4(C_bck[N * (ty * THREAD_SIZE_Y + i) + tx * THREAD_SIZE_X]) = FETCH_FLOAT4(res[i][0]);
-        FETCH_FLOAT4(C_bck[N * (ty * THREAD_SIZE_Y + i) + tx * THREAD_SIZE_X + 4]) = FETCH_FLOAT4(res[i][4]);
+    for(int i = 0; i < THREAD_SIZE_Y; i ++) {
+        LDSTFLOAT4(C_bck[(ty * THREAD_SIZE_Y + i) * N + tx * THREAD_SIZE_X]) = LDSTFLOAT4(res[i][0]);
+        LDSTFLOAT4(C_bck[(ty * THREAD_SIZE_Y + i) * N + tx * THREAD_SIZE_X + 4]) = LDSTFLOAT4(res[i][4]);
     }
 
     return;

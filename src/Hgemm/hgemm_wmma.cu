@@ -1,7 +1,10 @@
 #include <cuda_runtime.h>
 #include "common/tester.h"
+#include "common/util.h"
 
 using namespace nvcuda;
+#define LDST32BITS(pointer) (reinterpret_cast<half2*>(&(pointer))[0])
+#define LDST64BITS(pointer) (reinterpret_cast<float2*>(&(pointer))[0])
 /*
 template<typename Use, int m, int n, int k, typename T, typename Layout=void> class fragment;
 void load_matrix_sync(fragment<...> &a, const T *mprt, unsigned ldm);
@@ -11,6 +14,7 @@ void fill_fragment(fragment<...> &a, const T& v);
 void mma_sync(fragment<...> &a, fragment<...> &b, const fragment<...> &c, bool staf=false);
 */
 
+/* naive wmma version*/
 template<unsigned int WMMA_M = 16,
          unsigned int WMMA_N = 16,
          unsigned int WMMA_K = 16>
@@ -30,12 +34,12 @@ __global__ void hgemm_wmma_m16n16k16_kernel_v1(half *A, half *B, half *C, unsign
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag;
 
+#pragma unroll
     for(int k = 0; k < K; k += WMMA_K) {
         wmma::load_matrix_sync(A_frag, A_bck + k, K);
         wmma::load_matrix_sync(B_frag, B_bck + k * N, N);
 
         wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
-        __syncthreads();
     }
 
     if(row + WMMA_M <= M && col + WMMA_N <= N) {
@@ -51,13 +55,86 @@ void hgemm_wmma_m16n16k16_v1(half *A, half *B, half *C, unsigned int M, unsigned
     hgemm_wmma_m16n16k16_kernel_v1<WMMA_M, WMMA_N, WMMA_K><<<grid, block>>>(A, B, C, M, N, K); 
 }
 
+/* 
+    v2: tiled sharedMem 
+    一个Block包含8个warp，每个warp处理1个wmma操作——一个block处理[WMMA_N*WMMA_TILE_N, WMMA_M*WMMA_TILE_M]个数据
+*/
+template<const int WMMA_M = 16,
+         const int WMMA_N = 16,
+         const int WMMA_K = 16,
+         const int WMMA_TILE_M = 4,
+         const int WMMA_TILE_N = 2>
+__global__ void hgemm_wmma_m16n16k16_kernel_v2(half *A, half *B, half *C, int M, int N, int K) {
+
+    constexpr int BM = WMMA_M * WMMA_TILE_M; // 64
+    constexpr int BN = WMMA_N * WMMA_TILE_N; // 32
+    constexpr int BK = WMMA_K;  // 16
+    __shared__ half tileA[BM][BK], tileB[BK][BN];
+
+    unsigned int ty = threadIdx.y;
+    unsigned int tx = threadIdx.x;
+    const int tid = ty * blockDim.x + tx;
+    const int warp_id = tid / 32;
+    const int warp_m = warp_id / 2;
+    const int warp_n = warp_id % 2;
+    const int NUM_K_TILES = (K + WMMA_K - 1) / WMMA_K;
+  
+    // 256threads 处理 tileA[64][16]  tileB[16][32];
+    const int load_smem_a_m = tid / 4;
+    const int load_smem_a_k = (tid % 4) * 4;
+    const int load_smem_b_n = (tid % 16) * 2;
+    const int load_smem_b_k = tid / 16;
+
+    const int load_gmem_a_m = blockIdx.y * BM + load_smem_a_m;
+    const int load_gmem_b_n = blockIdx.x * BN + load_smem_b_n;
+
+    if(load_gmem_a_m >= M || load_gmem_b_n >= N)
+        return;
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag;
+    wmma::fill_fragment(C_frag, 0.0);
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag;
+
+#pragma unroll
+    for(int k = 0; k < NUM_K_TILES; k++) {
+        int load_gmem_a_k = k * WMMA_K + load_smem_a_k;
+        int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
+        int load_gmem_b_k = k * WMMA_K + load_smem_b_k;
+        int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
+        LDST64BITS(tileA[load_smem_a_m][load_smem_a_k]) = LDST64BITS(A[load_gmem_a_addr]);
+        LDST32BITS(tileB[load_smem_b_k][load_smem_b_n]) = LDST32BITS(B[load_gmem_b_addr]);
+        __syncthreads();
+        wmma::load_matrix_sync(A_frag, &tileA[warp_m * WMMA_M][0], BK);
+        wmma::load_matrix_sync(B_frag, &tileB[0][warp_n * WMMA_N], BN);
+        wmma::mma_sync(C_frag, A_frag, B_frag, C_frag);
+        __syncthreads();
+    }
+
+    const int store_gmem_a_m = blockIdx.y * BM + warp_m * WMMA_M;
+    const int store_gmem_a_n = blockIdx.x * BN + warp_n * WMMA_N;
+    wmma::store_matrix_sync(C+store_gmem_a_m*N + store_gmem_a_n, C_frag, N, wmma::mem_row_major);
+    return;
+}
+void hgemm_wmma_m16n16k16_v2(half *A, half *B, half *C, unsigned int M, unsigned int N, unsigned int K) {
+
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_N = 16;
+    constexpr int WMMA_K = 16;
+    constexpr int WMMA_TILE_M = 4;
+    constexpr int WMMA_TILE_N = 2;
+    dim3 block(256);
+    dim3 grid((N + WMMA_N*WMMA_TILE_N - 1)/(WMMA_N*WMMA_TILE_N), (M + WMMA_M*WMMA_TILE_M - 1) / (WMMA_M*WMMA_TILE_M));
+    hgemm_wmma_m16n16k16_kernel_v2<WMMA_M, WMMA_N, WMMA_K, WMMA_TILE_M, WMMA_TILE_N><<<grid, block>>>(A, B, C, M, N, K);
+}
+
 int main() {
     Tester tester(512, 2048, 1024, 1, 10, 100, true);
-    const int opt = 1;
+    const int opt = 2;
     if(opt == 1) {
-        tester.evaluate(hgemm_wmma_m16n16k16_v1, "hgemm_wmma_m16n16k16_kernel");
+        tester.evaluate(hgemm_wmma_m16n16k16_v1, "hgemm_wmma_m16n16k16_kernel_v1");
     }else if(opt == 2) {
-
+        tester.evaluate(hgemm_wmma_m16n16k16_v2, "hgemm_wmma_m16n16k16_kernel_v2");
     }
     return 0;
 }
