@@ -1,3 +1,5 @@
+#include <cinttypes>
+#include <cstdint>
 #include <cuda_runtime.h>
 #include "common/tester.h"
 #include "common/util.h"
@@ -228,15 +230,159 @@ void hgemm_wmma_m16n16k16_v3(half *A, half *B, half *C, unsigned int M, unsigned
     return;
 }
 
+/*
+    v4: double buffer
+    @block/mma: 同上
+    @async data.mov
+*/
+// ca(cache all, L1+L2): support 4, 8, 16Bytes, cg(cache global, L2): only support 16Bytes.
+#define CP_ASYNC_CA(dst, src, bytes) asm volatile("cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(dst), "l"(src), "n"(bytes))
+#define CP_ASYNC_CG(dst, src, bytes) asm volatile("cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" ::"r"(dst), "l"(src), "n"(bytes))
+#define CP_ASYNC_COMMIT_GROUP() asm volatile("cp.async.commit_group;\n" ::)
+#define CP_ASYNC_WAIT_ALL() asm volatile("cp.async.wait_all;\n" ::)
+#define CP_ASYNC_WAIT_GROUP(n) asm volatile("cp.async.wait_group %0;\n" ::"n"(n))
+
+template<const int WMMA_M = 16,
+         const int WMMA_N = 16,
+         const int WMMA_K = 16,
+         const int WMMA_TILE_M = 4,
+         const int WMMA_TILE_N = 2,
+         const int WARP_TILE_M = 2,
+         const int WARP_TILE_N = 4>
+__global__ void hgemm_wmma_m16n16k16_kernel_v4(half *A, half *B, half *C, unsigned int M, unsigned int N, unsigned int K) {
+
+    const int BM = WMMA_M * WMMA_TILE_M * WARP_TILE_M; // 128
+    const int BN = WMMA_N * WMMA_TILE_N * WARP_TILE_N; // 128
+    const int BK = WMMA_K;
+    __shared__ half tileA[2][BM][BK], tileB[2][BK][BN];
+
+    const int K_NUM_TILES = div_ceil(K, WMMA_K);
+    const int ty = threadIdx.y;
+    const int tx = threadIdx.x;
+    const int tid = ty * blockDim.x + tx;
+    const int warp_id =  tid / 32;
+    const int warp_m = warp_id / 2;
+    const int warp_n = warp_id % 2;
+    
+    const int load_smem_a_m = tid / 2;
+    const int load_smem_a_k = (tid % 2) * 8;
+    const int load_smem_b_k = tid / 16;
+    const int load_smem_b_n = (tid % 16) * 8;
+
+    const int load_gmem_a_m = blockIdx.y * BM + load_smem_a_m;
+    const int load_gmem_b_n = blockIdx.x * BN + load_smem_b_n;
+
+    if(load_gmem_a_m >= M || load_gmem_b_n >= N) return;
+
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> C_frag[WARP_TILE_M][WARP_TILE_N];
+    for(int i = 0; i < WARP_TILE_M; i ++) {
+        for(int j = 0; j < WARP_TILE_N; j ++) {
+            wmma::fill_fragment(C_frag[i][j], 0.0); 
+        }
+    }
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag[WARP_TILE_M];
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag[WARP_TILE_N];
+
+    {
+        int load_gmem_a_k = load_smem_a_k;
+        int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
+        int load_gmem_b_k = load_smem_b_k;
+        int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
+        uint32_t load_smem_a_ptr = __cvta_generic_to_shared(&tileA[0][load_smem_a_m][load_smem_a_k]);
+        CP_ASYNC_CG(load_smem_a_ptr, &A[load_gmem_a_addr], 16);
+
+        uint32_t load_smem_b_ptr = __cvta_generic_to_shared(&tileB[0][load_smem_b_k][load_smem_b_n]);
+        CP_ASYNC_CG(load_smem_b_ptr, &B[load_gmem_b_addr], 16);
+
+        CP_ASYNC_COMMIT_GROUP();
+        CP_ASYNC_WAIT_GROUP(0);
+    }
+    __syncthreads();
+
+    for(int s = 1; s < K_NUM_TILES; s ++) {
+        int smem_sel = (s - 1) & 1;
+        int smem_sel_next = s & 1;
+
+        int load_gmem_a_k = s * BK + load_smem_a_k;
+        int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
+        int load_gmem_b_k = s * BK + load_smem_b_k;
+        int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
+
+       uint32_t load_smem_a_ptr = __cvta_generic_to_shared(&tileA[smem_sel_next][load_smem_a_m][load_smem_a_k]);
+        CP_ASYNC_CG(load_smem_a_ptr, &A[load_gmem_a_addr], 16);
+
+        uint32_t load_smem_b_ptr = __cvta_generic_to_shared(&tileB[smem_sel_next][load_smem_b_k][load_smem_b_n]);
+        CP_ASYNC_CG(load_smem_b_ptr, &B[load_gmem_b_addr], 16); 
+
+        for(int i = 0; i < WARP_TILE_M; i ++) {
+            wmma::load_matrix_sync(A_frag[i], &tileA[smem_sel][warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M][0], BK);
+        }
+        for(int j = 0; j < WARP_TILE_N; j ++) {
+            wmma::load_matrix_sync(B_frag[j], &tileB[smem_sel][0][warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N], BN);
+        }
+        for(int i = 0; i < WARP_TILE_M; i ++) {
+            for(int j = 0; j < WARP_TILE_N; j ++) {
+                wmma::mma_sync(C_frag[i][j], A_frag[i], B_frag[j], C_frag[i][j]);
+            }
+        }
+        CP_ASYNC_COMMIT_GROUP();
+        CP_ASYNC_WAIT_GROUP(0);
+        __syncthreads();
+    }
+
+    //last tile
+    {
+        for(int i = 0; i < WARP_TILE_M; i ++) {
+            wmma::load_matrix_sync(A_frag[i], &tileA[1][warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M][0], BK);
+        }
+        for(int j = 0; j < WARP_TILE_N; j ++) {
+            wmma::load_matrix_sync(B_frag[j], &tileB[1][0][warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N], BN);
+        }
+        for(int i = 0; i < WARP_TILE_M; i ++) {
+            for(int j = 0; j < WARP_TILE_N; j ++) {
+                wmma::mma_sync(C_frag[i][j], A_frag[i], B_frag[j], C_frag[i][j]);
+            }
+        }
+    }
+    
+    for(int i = 0; i < WARP_TILE_M; i ++) {
+        for(int j = 0; j < WARP_TILE_N; j ++) {
+            const int store_matrix_gmem_m = blockIdx.y * BM + warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M;
+            const int store_matrix_gmem_n = blockIdx.x * BN + warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N;
+            wmma::store_matrix_sync(C + store_matrix_gmem_m * N + store_matrix_gmem_n, C_frag[i][j], N, wmma::mem_row_major); 
+        }
+    }
+
+    return;
+}
+void hgemm_wmma_m16n16k16_v4(half *A, half *B, half *C, unsigned int M, unsigned int N, unsigned K) {
+
+    constexpr int WMMA_M = 16; 
+    constexpr int WMMA_K = 16; 
+    constexpr int WMMA_N = 16; 
+    constexpr int WMMA_TILE_M = 4;
+    constexpr int WMMA_TILE_N = 2;
+    constexpr int WARP_TILE_M = 2;
+    constexpr int WARP_TILE_N = 4;
+
+    dim3 block(256);
+    dim3 grid(div_ceil(N, WMMA_N*WMMA_TILE_N*WARP_TILE_N), div_ceil(M, WMMA_TILE_M*WMMA_M*WARP_TILE_M));
+    hgemm_wmma_m16n16k16_kernel_v4<WMMA_M, WMMA_N, WMMA_K, WMMA_TILE_M, WMMA_TILE_N, WARP_TILE_M, WARP_TILE_N><<<grid, block>>>(A, B, C, M, N, K);
+
+    return;
+}
+
 int main() {
     Tester tester(512, 2048, 1024, 1, 10, 100, true);
-    const int opt = 3;
+    const int opt = 4;
     if(opt == 1) {
         tester.evaluate(hgemm_wmma_m16n16k16_v1, "hgemm_wmma_m16n16k16_kernel_v1");
     }else if(opt == 2) {
         tester.evaluate(hgemm_wmma_m16n16k16_v2, "hgemm_wmma_m16n16k16_kernel_v2");
     }else if(opt == 3) {
         tester.evaluate(hgemm_wmma_m16n16k16_v3, "hgemm_wmma_m16n16k16_kernel_v3");
+    }else if(opt == 4) {
+        tester.evaluate(hgemm_wmma_m16n16k16_v4, "hgemm_wmma_m16n16k16_kernel_v4");
     }
     return 0;
 }
