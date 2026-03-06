@@ -1,4 +1,3 @@
-#include <cinttypes>
 #include <cstdint>
 #include <cuda_runtime.h>
 #include "common/tester.h"
