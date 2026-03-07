@@ -64,7 +64,7 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
         uint32_t RB[2];
 
         uint32_t load_smem_a_ptr = __cvta_generic_to_shared(&tileA[lane_id % 16][(lane_id / 16) * 8]);
-        LDMATRIX_X4(RA[0], RA[1], RA[2], RA[4], load_smem_a_ptr);
+        LDMATRIX_X4(RA[0], RA[1], RA[2], RA[3], load_smem_a_ptr);
         uint32_t load_smem_b_ptr = __cvta_generic_to_shared(&tileB[lane_id % 16][0]);
         LDMATRIX_X2_t(RB[0], RB[1], load_smem_b_ptr);
 
@@ -90,7 +90,7 @@ void hgemm_mma_m16n8k16_v1(half *A, half *B, half *C, unsigned int M, unsigned i
     constexpr int MMA_K = 16; 
     constexpr int MMA_N = 8; 
 
-    dim3 block(256);
+    dim3 block(32);
     dim3 grid(div_ceil(N, MMA_N), div_ceil(M, MMA_M));
     hgemm_mma_m16n8k16_kernel_v1<MMA_M, MMA_N, MMA_K><<<grid, block>>>(A, B, C, M, N, K);
     return;
@@ -98,7 +98,7 @@ void hgemm_mma_m16n8k16_v1(half *A, half *B, half *C, unsigned int M, unsigned i
 
 int main() {
     Tester tester(512, 2048, 1024, 1, 10, 100, true);
-    const int opt = 4;
+    const int opt = 1;
     if(opt == 1) {
         tester.evaluate(hgemm_mma_m16n8k16_v1, "hgemm_mma_m16n16k16_kernel_v1");
     }
