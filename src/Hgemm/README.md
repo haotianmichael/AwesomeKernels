@@ -6,4 +6,5 @@
 * [cuBLAS](https://www.cnblogs.com/cuancuancuanhao/p/7763256.html)
 * [关于Bank Conflict与Swizzle](https://zhuanlan.zhihu.com/p/11132414477)
 * [实用Swizzle教程](https://zhuanlan.zhihu.com/p/20579515046)
+* [bank conflict冲突](https://zhuanlan.zhihu.com/p/9840919069)
 
