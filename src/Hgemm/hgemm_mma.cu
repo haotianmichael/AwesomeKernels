@@ -2,7 +2,7 @@
 #include <cuda_runtime.h>
 #include "common/tester.h"
 #include "common/util.h"
-
+#include "ptx.cuh"
 
 #define LDST128BITS(pointer) (reinterpret_cast<float4 *>(&(pointer))[0])
 #define LDST32BITS(pointer) (reinterpret_cast<half2 *>(&(pointer))[0])
@@ -14,10 +14,17 @@
 #define LDMATRIX_X4(R0, R1, R2, R3, addr) asm volatile("ldmatrix.sync.aligned.x4.m8n8.shared.b16 {%0, %1, %2, %3}, [%4];\n" : "=r"(R0), "=r"(R1), "=r"(R2), "=r"(R3) : "r"(addr))
 #define LDMATRIX_X2_t(R0, R1, addr) asm volatile("ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];\n" : "=r"(R0), "=r"(R1) : "r"(addr))
 #define HMMA16816(RD0, RD1, RA0, RA1, RA2, RA3, RB0, RB1, RC0, RC1) asm volatile("mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%8, %9};\n" : "=r"(RD0), "=r"(RD1) : "r"(RA0), "r"(RA1), "r"(RA2), "r"(RA3), "r"(RB0), "r"(RB1), "r"(RC0), "r"(RC1))
+__device__ __forceinline__ void ld_st_128bit(void *dst, void *src) {
+    *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<float4 *>(src);
+} 
 
+__device__ __forceinline__ void ld_st_32bit(void *dst, void *src) {
+    *reinterpret_cast<half2 *>(dst) = *reinterpret_cast<half2 *>(src);
+}
 
 /*
     @ldmatrix首先搬运sharedmem地址, 然后搬运数据
+    @自定义uint32_t寄存器
 */
 template<const int MMA_M = 16,
          const int MMA_N = 8,
@@ -93,6 +100,106 @@ void hgemm_mma_m16n8k16_v1(half *A, half *B, half *C, unsigned int M, unsigned i
     dim3 block(32);
     dim3 grid(div_ceil(N, MMA_N), div_ceil(M, MMA_M));
     hgemm_mma_m16n8k16_kernel_v1<MMA_M, MMA_N, MMA_K><<<grid, block>>>(A, B, C, M, N, K);
+    return;
+}
+
+/*
+    @bank conflict solved by padding
+    @wmma寄存器
+*/
+using namespace nvcuda;
+__global__ void bank_conflict_solver_kernel_padding(half *A, half *B, half *C) {
+
+    __shared__ half tileA[16][16];
+    __shared__ half tileB[16][16];
+
+    /* @padding solver
+    __shared__ half tileA[16][16 + 8];
+    __shared__ half tileB[16][16 + 8];*/
+    __shared__ half tileC[16*16];
+
+    int tx = threadIdx.x;
+    ld_st_128bit(&(tileA[tx/2][(tx%2)*8]), A+8*tx);
+    ld_st_128bit(&(tileB[tx/2][(tx%2)*8]), B+8*tx);
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
+
+    wmma::load_matrix_sync(a_frag, tileA[0], 16);
+    wmma::load_matrix_sync(b_frag, tileB[0], 16);
+
+    /* @padding solver
+    wmma::load_matrix_sync(a_frag, tileA[0], 16 + 8);
+    wmma::load_matrix_sync(b_frag, tileB[0], 16 + 8);*/
+
+    wmma::fill_fragment(c_frag, 0.0f);
+    wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+    wmma::store_matrix_sync(tileC, c_frag, 16, wmma::mem_row_major);
+
+    __syncthreads();
+    ld_st_128bit(C+8*tx, tileC + 8 *tx);
+}
+void bank_conflict_solver_padding(half *A, half *B, half*C, int M, int N, int K) {
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_K = 16;
+    constexpr int WMMA_N = 16;
+    dim3 block(32);
+    dim3 grid(1);
+    bank_conflict_solver_kernel_padding<<<grid, block>>>(A, B, C);
+    return;
+}
+
+/*
+    @bank conflict solved by swizzle
+    @wmma寄存器
+    S: SShift, right shift the addr for swizzleing
+    B: BShift, bits to be swizzled
+    M: MBase, bits keep the same
+*/
+template<uint32_t S, uint32_t B, uint32_t M>
+__device__ __forceinline__ uint32_t swizzle(uint32_t addr) {
+    constexpr auto Bmask = ((1 << B) - 1) << M;
+    return ((addr >> S) & Bmask) ^ addr;
+}
+__global__ void bank_conflict_solver_kernel_swizzle(half *A, half *B, half *C) {
+
+    __shared__ half tileA[16*16];
+    __shared__ half tileB[16*16];
+    __shared__ half tileC[16*16];
+
+    int tx = threadIdx.x;
+    uint32_t gAddr = tx * 8;
+    auto g2sAddr = swizzle<3, 1, 3>(gAddr);
+    ld_st_128bit(tileA + g2sAddr, A+gAddr);
+    ld_st_128bit(tileB + g2sAddr, B+gAddr);
+    __syncthreads();
+
+    wmma::fragment<wmma::matrix_a, 16, 16, 16, half, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, 16, 16, 16, half, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, 16, 16, 16, half> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    uint32_t rAddr = (tx % 16) * 16 + (tx / 16) * 8;
+    auto r2sAddr = swizzle<3, 1, 3>(rAddr);
+
+    ptx::ldmatrix_sync(a_frag.x, tileA + r2sAddr);
+    ptx::ldmatrix_trans_sync(b_frag.x, tileB +r2sAddr);
+
+    ptx::mma_sync_m16n8k16(c_frag.x, a_frag.x, b_frag.x);
+    ptx::mma_sync_m16n8k16(c_frag.x + 4, a_frag.x, b_frag.x + 4);
+    ptx::stmatrix_sync(tileC + r2sAddr, c_frag.x);
+
+    ld_st_128bit(C+8*tx, tileC + 8 *tx);
+}
+void bank_conflict_solver_swizzle(half *A, half *B, half*C, int M, int N, int K) {
+    constexpr int WMMA_M = 16;
+    constexpr int WMMA_K = 16;
+    constexpr int WMMA_N = 16;
+    dim3 block(32);
+    dim3 grid(1);
+    bank_conflict_solver_kernel_padding<<<grid, block>>>(A, B, C);
     return;
 }
 
