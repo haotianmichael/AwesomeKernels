@@ -45,4 +45,36 @@ __device__ __forceinline__ void stmatrix_sync(half *dst, half *src) {
     }
 }
 
+// ca(cache all, L1+L2): support 4, 8, 16Bytes, cg(cache global, L2): only support 16Bytes.
+template<int BYTES>
+__device__ __forceinline__ void cp_async_ca(half *dst, half *src) {
+    asm volatile(
+        "cp.async.ca.shared.global.L2::128B [%0], [%1], %2;\n" :: 
+        "l"(__cvta_generic_to_shared(dst)),
+        "l"(src),
+        "n"(BYTES)
+    );
+}
+
+template<int BYTES>
+__device__ __forceinline__ void cp_async_cg(half *dst, half *src) {
+    asm volatile(
+        "cp.async.cg.shared.global.L2::128B [%0], [%1], %2;\n" :: 
+        "l"(__cvta_generic_to_shared(dst)),
+        "l"(src),
+        "n"(BYTES)
+    );
+}
+
+__device__ __forceinline__ void cp_async_commit_group() {
+    asm volatile("cp.async.commit_group;\n" ::);
+}
+__device__ __forceinline__ void cp_async_wait_all() {
+    asm volatile("cp.async.wait_all;\n" ::);
+}
+template<int BYTES>
+__device__ __forceinline__ void cp_async_wait_group() {
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(BYTES));
+}
+
 }
