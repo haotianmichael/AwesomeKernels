@@ -48,13 +48,15 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
     for(int k = 0; k < NUM_K_TILES; k ++) {
         int load_gmem_a_k = k * BK + load_smem_a_k;
         int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
-        ld_st_128bit(&tileA[load_smem_a_m][load_smem_a_k], &A[load_gmem_a_addr]);
+        ptx::cp_async_cg<16>(&tileA[load_smem_a_m][load_smem_a_k], &A[load_gmem_a_addr]);
         
         if(lane_id < MMA_K) {
             int load_gmem_b_k = k * MMA_K + load_smem_b_k;
             int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
-            ld_st_128bit(&tileB[load_smem_b_k][load_smem_b_n], &B[load_gmem_b_addr]);
+            ptx::cp_async_cg<16>(&tileB[load_smem_b_k][load_smem_b_n], &B[load_gmem_b_addr]);
         }
+        ptx::cp_async_commit_group();
+        ptx::cp_async_wait_group<0>();
         __syncthreads();
 
         uint32_t RA[4];
@@ -74,7 +76,7 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
         int store_gmem_c_m = by * BM + lane_id;
         int store_gmem_c_n = bx * BN;
         int store_gmem_c_addr = store_gmem_c_m * N + store_gmem_c_n;
-        ld_st_128bit(&C[store_gmem_c_addr], &tileC[lane_id][0]);
+        ptx::cp_async_cg<16>(&C[store_gmem_c_addr], &tileC[lane_id][0]);
     }
     return;
 }
