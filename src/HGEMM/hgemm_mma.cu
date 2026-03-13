@@ -7,7 +7,6 @@
 __device__ __forceinline__ void ld_st_128bit(void *dst, void *src) {
     *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<float4 *>(src);
 } 
-
 __device__ __forceinline__ void ld_st_32bit(void *dst, void *src) {
     *reinterpret_cast<half2 *>(dst) = *reinterpret_cast<half2 *>(src);
 }
@@ -60,7 +59,7 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
         half RB[4];
 
         ptx::ldmatrix_sync(RA, &tileA[lane_id % 16][(lane_id/16)*8]);
-        ptx::ldmatrix_sync(RB, &tileB[lane_id % 16][0]);
+        ptx::ldmatrix_trans_sync(RB, &tileB[lane_id % 16][0]);
         ptx::mma_sync_m16n8k16(RC, RA, RB);
         __syncthreads();
     }

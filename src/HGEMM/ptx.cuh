@@ -18,12 +18,10 @@ __device__ __forceinline__ void ldmatrix_sync(half *dst, void *addr) {
 
 __device__ __forceinline__ void ldmatrix_trans_sync(half *dst, void *addr) {
     asm volatile(
-      "ldmatrix.sync.aligned.x4.m8n8.shared.trans.b16 {%0, %1, %2, %3}, [%4];" 
-      : "=r"(REG(dst[0])), 
-        "=r"(REG(dst[2])), 
-        "=r"(REG(dst[4])), 
-        "=r"(REG(dst[6])) 
-      : "l"(__cvta_generic_to_shared(addr)));
+      "ldmatrix.sync.aligned.x2.trans.m8n8.shared.b16 {%0, %1}, [%2];"
+     : "=r"(REG(dst[0])),
+       "=r"(REG(dst[2])) 
+     : "l"(__cvta_generic_to_shared(addr)));
 }
 
 __device__ __forceinline__ void mma_sync_m16n8k16(half *c, half *a, half *b) {
