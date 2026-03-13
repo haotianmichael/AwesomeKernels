@@ -1,9 +1,11 @@
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "common/common.h"
 #include "common/tester.h"
 #include "common/util.h"
 #include "ptx.cuh"
 
+using namespace nvcuda;
 __device__ __forceinline__ void ld_st_128bit(void *dst, void *src) {
     *reinterpret_cast<float4 *>(dst) = *reinterpret_cast<float4 *>(src);
 } 
@@ -41,8 +43,8 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
     const int load_gmem_a_m = by * BM + load_smem_a_m;
     const int load_gmem_b_n = bx * BN + load_smem_b_n;
     if(load_gmem_a_m >= M && load_gmem_b_n >= N) return;
-
-    half RC[4] = {0, 0, 0, 0};
+   
+    uint32_t RC[4] = {0, 0, 0, 0};
     for(int k = 0; k < NUM_K_TILES; k ++) {
         int load_gmem_a_k = k * BK + load_smem_a_k;
         int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
@@ -55,8 +57,8 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
         }
         __syncthreads();
 
-        half RA[8];
-        half RB[4];
+        uint32_t RA[4];
+        uint32_t RB[4];
 
         ptx::ldmatrix_sync(RA, &tileA[lane_id % 16][(lane_id/16)*8]);
         ptx::ldmatrix_trans_sync(RB, &tileB[lane_id % 16][0]);
@@ -92,7 +94,6 @@ void hgemm_mma_m16n8k16_v1(half *A, half *B, half *C, unsigned int M, unsigned i
     @bank conflict solved by padding
     @wmma寄存器
 */
-using namespace nvcuda;
 __global__ void bank_conflict_solver_kernel_padding(half *A, half *B, half *C) {
 
     __shared__ half tileA[16][16];
@@ -142,7 +143,7 @@ void bank_conflict_solver_padding(half *A, half *B, half*C, int M, int N, int K)
     S: SShift, right shift the addr for swizzleing
     B: BShift, bits to be swizzled
     M: MBase, bits keep the same
-*/
+
 template<uint32_t S, uint32_t B, uint32_t M>
 __device__ __forceinline__ uint32_t swizzle(uint32_t addr) {
     constexpr auto Bmask = ((1 << B) - 1) << M;
@@ -187,6 +188,7 @@ void bank_conflict_solver_swizzle(half *A, half *B, half*C, int M, int N, int K)
     bank_conflict_solver_kernel_padding<<<grid, block>>>(A, B, C);
     return;
 }
+*/
 
 int main() {
     Tester tester(512, 2048, 1024, 1, 10, 100, true);
