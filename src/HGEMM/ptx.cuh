@@ -26,7 +26,7 @@ __device__ __forceinline__ void ldmatrix_trans_sync(half *dst, void *addr) {
 
 __device__ __forceinline__ void mma_sync_m16n8k16(half *c, half *a, half *b) {
     asm volatile(
-      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%8, %9};\n" : "=r"(REG(c[0])), "=r"(REG(c[2])) : "r"(REG(a[0])), "r"(REG(a[2])), "r"(REG(a[4])), "r"(REG(a[6])), "r"(REG(b[0])), "r"(REG(b[2])), "r"(0), "r"(0));
+      "mma.sync.aligned.m16n8k16.row.col.f16.f16.f16.f16 {%0, %1}, {%2, %3, %4, %5}, {%6, %7}, {%8, %9};\n" : "=r"(REG(c[0])), "=r"(REG(c[2])) : "r"(REG(a[0])), "r"(REG(a[2])), "r"(REG(a[4])), "r"(REG(a[6])), "r"(REG(b[0])), "r"(REG(b[2])), "r"(REG(c[0])), "r"(REG(c[2])));
 }
 
 __device__ __forceinline__ void stmatrix_sync(half *dst, half *src) {
@@ -70,9 +70,9 @@ __device__ __forceinline__ void cp_async_commit_group() {
 __device__ __forceinline__ void cp_async_wait_all() {
     asm volatile("cp.async.wait_all;\n" ::);
 }
-template<int BYTES>
+template<int N>
 __device__ __forceinline__ void cp_async_wait_group() {
-    asm volatile("cp.async.wait_group %0;\n" ::"n"(BYTES));
+    asm volatile("cp.async.wait_group %0;\n" ::"n"(N));
 }
 
 }
