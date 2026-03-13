@@ -76,7 +76,7 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
         int store_gmem_c_m = by * BM + lane_id;
         int store_gmem_c_n = bx * BN;
         int store_gmem_c_addr = store_gmem_c_m * N + store_gmem_c_n;
-        ptx::cp_async_cg<16>(&C[store_gmem_c_addr], &tileC[lane_id][0]);
+        ld_st_128bit(&C[store_gmem_c_addr], &tileC[lane_id][0]);
     }
     return;
 }

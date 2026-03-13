@@ -67,16 +67,6 @@ __device__ __forceinline__ void cp_async_cg(half *dst, half *src) {
     );
 }
 
-template<int BYTES>
-__device__ __forceinline__ void cp_async_cg_reverse(half *dst, half *src) {
-    asm volatile(
-        "cp.async.cg.global.shared.L2::128B [%0], [%1], %2;\n" :: 
-        "l"(dst),
-        "l"(__cvta_generic_to_shared(src)),
-        "n"(BYTES)
-    );
-}
-
 __device__ __forceinline__ void cp_async_commit_group() {
     asm volatile("cp.async.commit_group;\n" ::);
 }
