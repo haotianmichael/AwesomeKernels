@@ -1,5 +1,6 @@
 #include <cstdint>
 #include <cuda_runtime.h>
+#include "common/common.h"
 #include "common/tester.h"
 #include "common/util.h"
 #include "ptx.cuh"
@@ -103,37 +104,36 @@ __global__ void hgemm_wmma_m16n16k16_kernel_opt(half *A, half *B, half *C, unsig
     }
     wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> A_frag[WARP_TILE_M];
     wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, wmma::row_major> B_frag[WARP_TILE_N];
-
+    uint32_t write_stage = 0;
     {
         int load_gmem_a_k = load_smem_a_k;
         int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
         int load_gmem_b_k = load_smem_b_k;
         int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
-        ptx::cp_async_cg<16>(&tileA[0][load_smem_a_m][load_smem_a_k], &A[load_gmem_a_addr]);
-        ptx::cp_async_cg<16>(&tileB[0][load_smem_b_k][load_smem_b_n], &B[load_gmem_b_addr]); 
+        ptx::cp_async_cg<16>(&tileA[write_stage][load_smem_a_m][load_smem_a_k], &A[load_gmem_a_addr]);
+        ptx::cp_async_cg<16>(&tileB[write_stage][load_smem_b_k][load_smem_b_n], &B[load_gmem_b_addr]); 
         ptx::cp_async_commit_group();
         ptx::cp_async_wait_group<0>();
+        write_stage ^= 1;
     }
     __syncthreads();
 
     for(int s = 1; s < K_NUM_TILES; s ++) {
-        int smem_sel = (s - 1) & 1;
-        int smem_sel_next = s & 1;
 
         int load_gmem_a_k = s * BK + load_smem_a_k;
         int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
         int load_gmem_b_k = s * BK + load_smem_b_k;
         int load_gmem_b_addr = load_gmem_b_k * N + load_gmem_b_n;
 
-        ptx::cp_async_cg<16>(&tileA[smem_sel_next][load_smem_a_m][load_smem_a_k], &A[load_gmem_a_addr]);
-        ptx::cp_async_cg<16>(&tileB[smem_sel_next][load_smem_b_k][load_smem_b_n], &B[load_gmem_b_addr]); 
-
+        ptx::cp_async_cg<16>(&tileA[write_stage][load_smem_a_m][load_smem_a_k], &A[load_gmem_a_addr]);
+        ptx::cp_async_cg<16>(&tileB[write_stage][load_smem_b_k][load_smem_b_n], &B[load_gmem_b_addr]); 
+        write_stage ^= 1;
 
         for(int i = 0; i < WARP_TILE_M; i ++) {
-            wmma::load_matrix_sync(A_frag[i], &tileA[smem_sel][warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M][0], BK);
+            wmma::load_matrix_sync(A_frag[i], &tileA[write_stage][warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M][0], BK);
         }
         for(int j = 0; j < WARP_TILE_N; j ++) {
-            wmma::load_matrix_sync(B_frag[j], &tileB[smem_sel][0][warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N], BN);
+            wmma::load_matrix_sync(B_frag[j], &tileB[write_stage][0][warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N], BN);
         }
         for(int i = 0; i < WARP_TILE_M; i ++) {
             for(int j = 0; j < WARP_TILE_N; j ++) {
@@ -147,11 +147,12 @@ __global__ void hgemm_wmma_m16n16k16_kernel_opt(half *A, half *B, half *C, unsig
 
     //last tile
     {
+        write_stage ^= 1;
         for(int i = 0; i < WARP_TILE_M; i ++) {
-            wmma::load_matrix_sync(A_frag[i], &tileA[1][warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M][0], BK);
+            wmma::load_matrix_sync(A_frag[i], &tileA[write_stage][warp_m * WARP_TILE_M * WMMA_M + i * WMMA_M][0], BK);
         }
         for(int j = 0; j < WARP_TILE_N; j ++) {
-            wmma::load_matrix_sync(B_frag[j], &tileB[1][0][warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N], BN);
+            wmma::load_matrix_sync(B_frag[j], &tileB[write_stage][0][warp_n * WARP_TILE_N * WMMA_N + j * WMMA_N], BN);
         }
         for(int i = 0; i < WARP_TILE_M; i ++) {
             for(int j = 0; j < WARP_TILE_N; j ++) {

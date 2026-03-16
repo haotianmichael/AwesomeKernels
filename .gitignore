@@ -3,3 +3,5 @@ cmake-build-*/
 CMakeFiles/
 *.cmake
 !CMakeLists.txt
+.cache/
+.vscode/
