@@ -44,7 +44,7 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
     const int load_gmem_b_n = bx * BN + load_smem_b_n;
     if(load_gmem_a_m >= M && load_gmem_b_n >= N) return;
    
-    uint32_t RC[4] = {0, 0, 0, 0};
+    uint32_t RC[2] = {0, 0};
     for(int k = 0; k < NUM_K_TILES; k ++) {
         int load_gmem_a_k = k * BK + load_smem_a_k;
         int load_gmem_a_addr = load_gmem_a_m * K + load_gmem_a_k;
@@ -60,7 +60,7 @@ __global__ void hgemm_mma_m16n8k16_kernel_v1(half *A, half *B, half *C, unsigned
         __syncthreads();
 
         uint32_t RA[4];
-        uint32_t RB[4];
+        uint32_t RB[2];
 
         ptx::ldmatrix_sync(RA, &tileA[lane_id % 16][(lane_id/16)*8]);
         ptx::ldmatrix_trans_sync(RB, &tileB[lane_id % 16][0]);
