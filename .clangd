@@ -10,10 +10,10 @@ CompileFlags:
     - --std=c++17
     
     # 项目包含路径（必须用绝对路径）
-    - -I/home/nfs/mahaotian/CUDA/DenseGEMM/cutlass/include
-    - -I/home/nfs/mahaotian/CUDA/DenseGEMM/cutlass/tools/util/include
-    - -I/home/nfs/mahaotian/CUDA/DenseGEMM/cutlass/examples/common
-    - -I/home/nfs/mahaotian/CUDA/DenseGEMM/cutlass/build/include
+    - -I/home/nfs/mahaotian/CUDA/AwesomeKernels/third-party/cutlass/include
+    - -I/home/nfs/mahaotian/CUDA/AwesomeKernels/third-party/cutlass/tools/util/include
+    - -I/home/nfs/mahaotian/CUDA/AwesomeKernels/third-party/cutlass/examples/common
+    - -I/home/nfs/mahaotian/CUDA/AwesomeKernels/third-party/cutlass/build/include
     
     # pytorch
     - -I/home/mahaotian/miniconda3/envs/py310/lib/python3.10/site-packages/torch/include

@@ -5,7 +5,7 @@ from torch.utils.cpp_extension import load
 
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
-cutlass_include_path = os.path.join(current_dir, "../../../cutlass/include")
+cutlass_include_path = os.path.join(current_dir, "../../third-party/cutlass/include")
 sources = [os.path.join(current_dir, filename) for filename in ["cute_hgemm.cu"]]
 
 os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(map(str, torch.cuda.get_device_capability()))
@@ -91,9 +91,9 @@ def compare_matrix(kernel_output: torch.Tensor, torch_output: torch.Tensor):
     )
 
 
-Ms = [8]
+Ms = [16]
 Ns = [8]
-Ks = [4]
+Ks = [8]
 exps = [(m, n, k) for m in Ms for n in Ns for k in Ks]
 
 torch.cuda.manual_seed_all(9527)
