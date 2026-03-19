@@ -15,6 +15,10 @@ CompileFlags:
     - -I/home/nfs/mahaotian/CUDA/DenseGEMM/cutlass/examples/common
     - -I/home/nfs/mahaotian/CUDA/DenseGEMM/cutlass/build/include
     
+    # pytorch
+    - -I/home/mahaotian/miniconda3/envs/py310/lib/python3.10/site-packages/torch/include
+    - -I/home/mahaotian/miniconda3/envs/py310/lib/python3.10/site-packages/torch/include/torch/csrc/api/include
+    
     # 智能感知标记
     - "-D__INTELLISENSE__"
     - "-D__CLANGD__"
