@@ -6,7 +6,7 @@ from torch.utils.cpp_extension import load
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 cutlass_include_path = os.path.join(current_dir, "../../third-party/cutlass/include")
-sources = [os.path.join(current_dir, filename) for filename in ["cute_hgemm.cu"]]
+sources = [os.path.join(current_dir, filename) for filename in ["launch.cu"]]
 
 os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(map(str, torch.cuda.get_device_capability()))
 
