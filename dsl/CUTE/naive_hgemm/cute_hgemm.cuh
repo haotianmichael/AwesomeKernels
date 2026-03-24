@@ -4,7 +4,7 @@
 #include <cute/tensor.hpp>
 
 template<typename Spec, bool IsGemm>
-__global__ void cute_hgemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k) {
+__global__ void naive_cute_hgemm(void *Cptr, const void *Aptr, const void *Bptr, int m, int n, int k) {
     using namespace cute;
 
     using X = Underscore;

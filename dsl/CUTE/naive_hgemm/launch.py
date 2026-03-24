@@ -12,7 +12,7 @@ os.environ["TORCH_CUDA_ARCH_LIST"] = ".".join(map(str, torch.cuda.get_device_cap
 
 # Load CUDA extension module
 lib = load(
-    name="cute_hgemm",
+    name="naive_cute_hgemm",
     sources=sources,
     extra_cuda_cflags=[
         "-O3",
@@ -107,13 +107,13 @@ for exp in exps:
     c = torch.randn(M, N, device="cuda", dtype=torch.half)
 
     # Case 1: MM
-    kernel_output = lib.cute_hgemm(a, b, None)
+    kernel_output = lib.naive_cute_hgemm(a, b, None)
     if not ENABLE_PROF:
         torch_output = torch.matmul(a, b.T)
         compare_matrix(kernel_output, torch_output)
 
     # Case 2: MMA
-    kernel_output = lib.cute_hgemm(a, b, c.clone())
+    kernel_output = lib.naive_cute_hgemm(a, b, c.clone())
     if not ENABLE_PROF:
         # Mathematically, this operation is equivalent to:
         #   torch_output = torch.matmul(a, b.T) + c

@@ -33,7 +33,7 @@
 
 
 template <typename ComputeType, typename AccType = ComputeType>
-torch::Tensor run_cute_hgemm(const torch::Tensor &a, const torch::Tensor &b, std::optional<torch::Tensor> &_c) {
+torch::Tensor run_naive_cute_hgemm(const torch::Tensor &a, const torch::Tensor &b, std::optional<torch::Tensor> &_c) {
 
   at::cuda::CUDAGuard device_guard{a.get_device()};
   auto stream = at::cuda::getCurrentCUDAStream().stream();
@@ -95,7 +95,7 @@ torch::Tensor run_cute_hgemm(const torch::Tensor &a, const torch::Tensor &b, std
 
   BOOL_SWITCH(is_gemm, IsGemm, [&]{
     cudaEventRecord(start, stream);
-    cute_hgemm<Spec, IsGemm><<<grid, block, shm_size, stream>>>(reinterpret_cast<AccType*>(c.data_ptr()), reinterpret_cast<ComputeType*>(a.data_ptr()), reinterpret_cast<ComputeType*>(b.data_ptr()), M, N, K);
+    naive_cute_hgemm<Spec, IsGemm><<<grid, block, shm_size, stream>>>(reinterpret_cast<AccType*>(c.data_ptr()), reinterpret_cast<ComputeType*>(a.data_ptr()), reinterpret_cast<ComputeType*>(b.data_ptr()), M, N, K);
     cudaEventRecord(stop, stream);
   });
 
@@ -117,5 +117,5 @@ torch::Tensor run_cute_hgemm(const torch::Tensor &a, const torch::Tensor &b, std
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-  m.def("cute_hgemm", &(run_cute_hgemm<cute::half_t>), "Run a single 8x8x4 MMA operation.");
+  m.def("naive_cute_hgemm", &(run_naive_cute_hgemm<cute::half_t>), "Run a naive 8x8x4 MMA operation.");
 }
