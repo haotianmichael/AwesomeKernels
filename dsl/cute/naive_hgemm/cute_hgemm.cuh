@@ -1,4 +1,3 @@
-#include "cute/arch/mma_sm80.hpp"
 #include <c10/cuda/CUDAGuard.h>
 #include <cuda_runtime.h>
 #include <cute/tensor.hpp>
